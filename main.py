@@ -48,9 +48,8 @@ def process_video(video_path: Path, output_dir: Path, display: bool = False) -> 
             break
 
         frame_count += 1
-        # Run tracking (placeholder logic via YOLOTracker)
-        results = tracker.track(frame)
-        annotated_frame = results[0].plot() if results else frame
+        # Run person detection and annotation via YOLOTracker
+        annotated_frame, _ = tracker.process_frame(frame)
 
         out.write(annotated_frame)
 
