@@ -1,14 +1,17 @@
 """
-YOLO Person Detection and Persistent Object Tracking Module.
+YOLO Pose Estimation and Persistent Object Tracking Module.
 
 This module implements a persistent computer vision tracking pipeline using
-Ultralytics YOLOv8 and ByteTrack (bytetrack.yaml) to eliminate bounding box
-flickering and identity swaps caused by water splashing and occlusion.
+Ultralytics YOLOv8 Pose (yolov8n-pose.pt) and ByteTrack (bytetrack.yaml) to track
+swimmers and estimate skeletal keypoints (shoulders, elbows, wrists, etc.)
+across video frames while eliminating bounding box flickering and identity swaps.
 
 Key Features:
+    - Pose estimation and keypoints extraction across frames using YOLOv8-pose.
     - Persistent tracking across frames using ByteTrack Kalman filter and Hungarian matching.
     - COCO class_id 0 ('person') filtering.
-    - Bounding boxes annotated with unique persistent Tracking ID and confidence score.
+    - Skeletal keypoint visualization using Ultralytics built-in plotting (results[0].plot()).
+    - Raw keypoint coordinate extraction and terminal logging for data inspection.
     - Motion trajectory history (tracking path) maintained and visualized across frames.
     - Interactive OpenCV video stream playback with responsive window scaling.
 """
@@ -29,7 +32,7 @@ from ultralytics import YOLO
 # Configuration Constants
 # ==============================================================================
 COCO_PERSON_CLASS_ID = 0  # Class index for 'person' in standard COCO dataset
-DEFAULT_MODEL_WEIGHTS = "yolov8n.pt"  # YOLOv8 nano pre-trained weights
+DEFAULT_MODEL_WEIGHTS = "yolov8n-pose.pt"  # YOLOv8 nano pose estimation pre-trained weights
 DEFAULT_CONF_THRESHOLD = 0.25  # Minimum confidence threshold (optimized for swimmers)
 DEFAULT_TRACKER_CONFIG = "bytetrack.yaml"  # ByteTrack algorithm configuration
 TRAJECTORY_MAX_POINTS = 60  # Number of historical points to keep in trajectory tail
@@ -37,9 +40,9 @@ TRAJECTORY_MAX_POINTS = 60  # Number of historical points to keep in trajectory 
 
 class YOLOTracker:
     """
-    Persistent Object Tracker using YOLOv8 and ByteTrack.
+    Persistent Object Tracker using YOLOv8 Pose and ByteTrack.
     Maintains track history, identity persistence through occlusions,
-    and renders visual bounding boxes with tracking IDs.
+    extracts skeletal keypoints, and renders visual skeleton overlays.
     """
 
     def __init__(
@@ -53,7 +56,7 @@ class YOLOTracker:
         """
         Initialize the persistent YOLO ByteTrack tracker.
 
-        :param model_weights: Pre-trained YOLO weights (e.g., 'yolov8n.pt').
+        :param model_weights: Pre-trained YOLO weights (e.g., 'yolov8n-pose.pt').
         :param conf_threshold: Minimum detection confidence threshold (0.0 - 1.0).
         :param tracker_config: Tracking configuration file (default: 'bytetrack.yaml').
         :param target_class_id: COCO class ID to isolate (0 = person).
@@ -65,13 +68,18 @@ class YOLOTracker:
         self.target_class_id = target_class_id
         self.trajectory_history_len = trajectory_history_len
 
+        # Frame counter for tracking & telemetry
+        self.frame_count: int = 0
+        self.latest_results: Optional[Any] = None
+        self.latest_keypoints: Optional[np.ndarray] = None
+
         # Trajectory history: stores center coordinates (x, y) deque for each unique track_id
         self.track_history: Dict[int, Deque[Tuple[int, int]]] = defaultdict(
             lambda: deque(maxlen=self.trajectory_history_len)
         )
 
         # Initialize YOLO model
-        print(f"[YOLOTracker] Initializing YOLO model '{self.model_weights}'...")
+        print(f"[YOLOTracker] Initializing YOLO pose model '{self.model_weights}'...")
         self.model: YOLO = YOLO(self.model_weights)
         print(
             f"[YOLOTracker] Loaded model. Configured with tracker='{self.tracker_config}' "
@@ -84,6 +92,7 @@ class YOLOTracker:
 
         Uses `model.track()` with `tracker='bytetrack.yaml'` and `persist=True`
         to preserve identity state across occlusions and water splashes.
+        Extracts skeletal keypoints and prints raw coordinates to the terminal.
 
         :param frame: Input BGR frame (numpy array from OpenCV).
         :return: List of detection dictionaries containing:
@@ -91,7 +100,10 @@ class YOLOTracker:
                  - 'confidence': float detection confidence (0.0 - 1.0)
                  - 'class_id': target class ID (0)
                  - 'track_id': unique persistent integer tracking ID (or None if unassigned)
+                 - 'keypoints': numpy array of shape (17, 2) coordinates (if available)
         """
+        self.frame_count += 1
+
         # Run persistent tracking inference
         # - tracker="bytetrack.yaml": uses ByteTrack Kalman filter matching
         # - persist=True: retains Kalman filter & trajectory memory from previous frames
@@ -104,6 +116,18 @@ class YOLOTracker:
             tracker=self.tracker_config,
             verbose=False,
         )
+        self.latest_results = results
+
+        # ----------------------------------------------------------------------
+        # Extract Keypoints Array & Print Raw Coordinates
+        # ----------------------------------------------------------------------
+        if results and len(results) > 0 and results[0].keypoints is not None:
+            keypoints_array = results[0].keypoints.xy.cpu().numpy()
+        else:
+            keypoints_array = np.empty((0, 17, 2), dtype=np.float32)
+
+        self.latest_keypoints = keypoints_array
+        print(f"Frame {self.frame_count} Keypoints Raw Coordinates:\n{keypoints_array}")
 
         detections: List[Dict[str, Any]] = []
 
@@ -114,7 +138,7 @@ class YOLOTracker:
         if boxes is None or len(boxes) == 0:
             return detections
 
-        for box in boxes:
+        for i, box in enumerate(boxes):
             cls_id = int(box.cls[0].item())
 
             # Double-check class filtering (class 0 = person)
@@ -133,14 +157,16 @@ class YOLOTracker:
                 center_y = int((y1 + y2) / 2)
                 self.track_history[track_id].append((center_x, center_y))
 
-            detections.append(
-                {
-                    "bbox": [x1, y1, x2, y2],
-                    "confidence": conf,
-                    "class_id": cls_id,
-                    "track_id": track_id,
-                }
-            )
+            det_dict: Dict[str, Any] = {
+                "bbox": [x1, y1, x2, y2],
+                "confidence": conf,
+                "class_id": cls_id,
+                "track_id": track_id,
+            }
+            if len(keypoints_array) > i:
+                det_dict["keypoints"] = keypoints_array[i]
+
+            detections.append(det_dict)
 
         return detections
 
@@ -148,42 +174,42 @@ class YOLOTracker:
         self,
         frame: np.ndarray,
         detections: List[Dict[str, Any]],
-        box_color: Tuple[int, int, int] = (0, 255, 127),  # High-visibility spring green
+        results: Optional[Any] = None,
         trail_color: Tuple[int, int, int] = (0, 191, 255),  # Deep sky blue trajectory trail
     ) -> np.ndarray:
         """
-        Draw bounding boxes with persistent tracking IDs, confidence scores,
-        and trajectory trails on the frame.
+        Draw visual annotations on the frame.
+
+        Uses ultralytics built-in plotting (results[0].plot()) to automatically
+        draw skeletal keypoints (shoulders, elbows, wrists) and tracking info over
+        the swimmer, and overlays motion trajectory history trails.
 
         :param frame: BGR image frame to annotate.
         :param detections: List of detection dicts produced by `detect()`.
-        :param box_color: BGR color tuple for bounding box and text badge.
+        :param results: Optional Ultralytics Results list/object. If None, uses self.latest_results.
         :param trail_color: BGR color tuple for motion trajectory tail.
         :return: Annotated BGR frame.
         """
-        annotated = frame.copy()
+        if results is None:
+            results = self.latest_results
+
+        # Use ultralytics built-in plotting to automatically draw skeletal keypoints
+        # (shoulders, elbows, wrists, etc.) and bounding boxes over the swimmer
+        if results and len(results) > 0:
+            annotated = results[0].plot()
+        else:
+            annotated = frame.copy()
+
         h, w = frame.shape[:2]
 
-        # Resolution-adaptive scaling for text and geometry
+        # Resolution-adaptive scaling for trajectory trails
         scale = max(0.5, min(w, h) / 1000.0)
         thickness = max(2, int(scale * 2.5))
-        font_scale = max(0.5, scale * 0.7)
         trail_thickness = max(2, int(thickness * 0.9))
 
+        # Render motion trajectory trails for tracked subjects
         for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            conf = det["confidence"]
-            track_id = det["track_id"]
-
-            # Format label displaying unique Tracking ID alongside confidence score
-            if track_id is not None:
-                label = f"ID #{track_id} | Conf: {conf:.2f}"
-            else:
-                label = f"ID: Detecting... | Conf: {conf:.2f}"
-
-            # ------------------------------------------------------------------
-            # 1. Draw Trajectory Trail
-            # ------------------------------------------------------------------
+            track_id = det.get("track_id")
             if track_id is not None and len(self.track_history[track_id]) > 1:
                 trail_points = np.array(
                     self.track_history[track_id], dtype=np.int32
@@ -197,59 +223,19 @@ class YOLOTracker:
                     lineType=cv2.LINE_AA,
                 )
 
-            # ------------------------------------------------------------------
-            # 2. Draw Bounding Box
-            # ------------------------------------------------------------------
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, thickness)
-
-            # ------------------------------------------------------------------
-            # 3. Draw Label Badge Background
-            # ------------------------------------------------------------------
-            (text_w, text_h), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
-            )
-
-            # Position label above bounding box (or inside if near frame ceiling)
-            badge_y1 = max(0, y1 - text_h - 10)
-            badge_y2 = y1
-            badge_x1 = x1
-            badge_x2 = min(w, x1 + text_w + 12)
-
-            # Solid color background badge for maximum readability
-            cv2.rectangle(
-                annotated,
-                (badge_x1, badge_y1),
-                (badge_x2, badge_y2),
-                box_color,
-                cv2.FILLED,
-            )
-
-            # High-contrast text on badge
-            text_pos = (badge_x1 + 6, badge_y2 - 6)
-            cv2.putText(
-                annotated,
-                label,
-                text_pos,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (0, 0, 0),  # Black text on vibrant badge
-                thickness=max(1, int(thickness / 2)),
-                lineType=cv2.LINE_AA,
-            )
-
         return annotated
 
     def process_frame(
         self, frame: np.ndarray
     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         """
-        Run detection, persistent tracking, and visual annotation on a frame.
+        Run detection, pose estimation, persistent tracking, and visual annotation on a frame.
 
         :param frame: Raw input BGR frame.
         :return: Tuple of (annotated_frame, list_of_detections).
         """
         detections = self.detect(frame)
-        annotated_frame = self.draw_annotations(frame, detections)
+        annotated_frame = self.draw_annotations(frame, detections, results=self.latest_results)
         return annotated_frame, detections
 
     # Backwards compatibility alias
@@ -275,12 +261,12 @@ def run_tracker(
     tracker_config: str = DEFAULT_TRACKER_CONFIG,
 ) -> None:
     """
-    OpenCV Persistent Video Tracking Loop:
+    OpenCV Persistent Video Tracking Loop with Pose Estimation:
       1. Open video input (default: /data/raw_videos/sample.mp4).
-      2. Initialize YOLOv8n model with ByteTrack persistent tracking.
+      2. Initialize YOLOv8n-pose model with ByteTrack persistent tracking.
       3. Loop through frames.
-      4. Detect and persistently track class_id 0 ('person').
-      5. Draw bounding box with unique Tracking ID and confidence score.
+      4. Detect and persistently track class_id 0 ('person') and estimate pose keypoints.
+      5. Draw skeletal keypoints (shoulders, elbows, wrists) using results[0].plot().
       6. Render motion trajectory history to visualize swimmer path.
       7. Display annotated stream via cv2.imshow with 'q' to quit.
       8. Clean up capture and window resources.
@@ -331,7 +317,7 @@ def run_tracker(
     # --------------------------------------------------------------------------
     # Setup OpenCV Window
     # --------------------------------------------------------------------------
-    window_name = "YOLOv8 + ByteTrack Swimmer Tracker (Press 'q' to exit)"
+    window_name = "YOLOv8 Pose + ByteTrack Swimmer Tracker (Press 'q' to exit)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     # Comfortable scale for 4K display preview
@@ -422,7 +408,7 @@ def run_tracker(
 # ==============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run YOLOv8 + ByteTrack Persistent Object Tracking Loop"
+        description="Run YOLOv8 Pose + ByteTrack Persistent Object Tracking Loop"
     )
     parser.add_argument(
         "--video",
