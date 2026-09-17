@@ -24,6 +24,9 @@ import time
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for headless plot generation
+import matplotlib.pyplot as plt
 import numpy as np
 from ultralytics import YOLO
 
@@ -36,6 +39,13 @@ DEFAULT_MODEL_WEIGHTS = "yolov8n-pose.pt"  # YOLOv8 nano pose estimation pre-tra
 DEFAULT_CONF_THRESHOLD = 0.25  # Minimum confidence threshold (optimized for swimmers)
 DEFAULT_TRACKER_CONFIG = "bytetrack.yaml"  # ByteTrack algorithm configuration
 TRAJECTORY_MAX_POINTS = 60  # Number of historical points to keep in trajectory tail
+
+
+# ==============================================================================
+# Stroke Analysis Time-Series Buffers
+# ==============================================================================
+left_wrist_y: List[float] = []
+right_wrist_y: List[float] = []
 
 
 class YOLOTracker:
@@ -259,28 +269,37 @@ def run_tracker(
     conf_threshold: float = DEFAULT_CONF_THRESHOLD,
     model_weights: str = DEFAULT_MODEL_WEIGHTS,
     tracker_config: str = DEFAULT_TRACKER_CONFIG,
+    show_preview: bool = True,
 ) -> None:
     """
-    OpenCV Persistent Video Tracking Loop with Pose Estimation:
+    OpenCV Persistent Video Tracking Loop with Pose Estimation & Stroke Signal Extraction:
       1. Open video input (default: /data/raw_videos/sample.mp4).
       2. Initialize YOLOv8n-pose model with ByteTrack persistent tracking.
       3. Loop through frames.
       4. Detect and persistently track class_id 0 ('person') and estimate pose keypoints.
-      5. Draw skeletal keypoints (shoulders, elbows, wrists) using results[0].plot().
-      6. Render motion trajectory history to visualize swimmer path.
-      7. Display annotated stream via cv2.imshow with 'q' to quit.
-      8. Clean up capture and window resources.
+      5. Extract wrist keypoints (index 9: left wrist, index 10: right wrist) for stroke detection.
+      6. Append wrist Y-coordinates (handling water occlusion via zero-order hold).
+      7. Draw skeletal keypoints (shoulders, elbows, wrists) using results[0].plot().
+      8. Render motion trajectory history to visualize swimmer path.
+      9. Clean up capture and window resources.
+      10. Generate and save 'stroke_signal.png' in /data/processed/ using matplotlib.
 
     :param video_source: Path to video file.
     :param conf_threshold: Confidence threshold for person detection.
     :param model_weights: YOLO model weights file.
     :param tracker_config: Tracker config file (default: 'bytetrack.yaml').
+    :param show_preview: Whether to display interactive OpenCV window during processing.
     """
+    global left_wrist_y, right_wrist_y
+    left_wrist_y.clear()
+    right_wrist_y.clear()
+
+    project_root = Path(__file__).resolve().parent.parent
+
     # --------------------------------------------------------------------------
     # 1. Video Input Resolution
     # --------------------------------------------------------------------------
     if video_source is None:
-        project_root = Path(__file__).resolve().parent.parent
         video_path = project_root / "data" / "raw_videos" / "sample.mp4"
     else:
         video_path = Path(video_source).resolve()
@@ -318,12 +337,12 @@ def run_tracker(
     # Setup OpenCV Window
     # --------------------------------------------------------------------------
     window_name = "YOLOv8 Pose + ByteTrack Swimmer Tracker (Press 'q' to exit)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    # Comfortable scale for 4K display preview
-    preview_w = min(1280, width)
-    preview_h = int(preview_w * (height / width))
-    cv2.resizeWindow(window_name, preview_w, preview_h)
+    if show_preview:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        # Comfortable scale for 4K display preview
+        preview_w = min(1280, width)
+        preview_h = int(preview_w * (height / width))
+        cv2.resizeWindow(window_name, preview_w, preview_h)
 
     frame_idx = 0
     start_time = time.time()
@@ -345,9 +364,65 @@ def run_tracker(
             frame_idx += 1
 
             # ------------------------------------------------------------------
-            # 4 & 5. Persistent Tracking & Annotation
+            # 4. Persistent Tracking & Pose Estimation
             # ------------------------------------------------------------------
             annotated_frame, detections = tracker.process_frame(frame)
+
+            # ------------------------------------------------------------------
+            # 5. Extract Wrist Keypoints for Swimming Stroke Detection
+            #    In YOLOv8 pose: index 9 is left wrist, index 10 is right wrist
+            # ------------------------------------------------------------------
+            current_lw_y: Optional[float] = None
+            current_rw_y: Optional[float] = None
+
+            if tracker.latest_results and len(tracker.latest_results) > 0:
+                results_obj = tracker.latest_results[0]
+                if (
+                    results_obj.keypoints is not None
+                    and results_obj.keypoints.xy is not None
+                    and results_obj.keypoints.xy.shape[0] > 0
+                ):
+                    kps_xy = results_obj.keypoints.xy[0].cpu().numpy()
+                    kps_conf = (
+                        results_obj.keypoints.conf[0].cpu().numpy()
+                        if results_obj.keypoints.conf is not None and results_obj.keypoints.conf.shape[0] > 0
+                        else None
+                    )
+
+                    # Extract left wrist (index 9)
+                    if len(kps_xy) > 9:
+                        lw_x, lw_val_y = float(kps_xy[9][0]), float(kps_xy[9][1])
+                        lw_conf = (
+                            float(kps_conf[9])
+                            if (kps_conf is not None and len(kps_conf) > 9)
+                            else 1.0
+                        )
+                        # Detected if coordinates non-zero and confidence meets threshold
+                        if (lw_x != 0.0 or lw_val_y != 0.0) and lw_conf >= conf_threshold:
+                            current_lw_y = lw_val_y
+
+                    # Extract right wrist (index 10)
+                    if len(kps_xy) > 10:
+                        rw_x, rw_val_y = float(kps_xy[10][0]), float(kps_xy[10][1])
+                        rw_conf = (
+                            float(kps_conf[10])
+                            if (kps_conf is not None and len(kps_conf) > 10)
+                            else 1.0
+                        )
+                        if (rw_x != 0.0 or rw_val_y != 0.0) and rw_conf >= conf_threshold:
+                            current_rw_y = rw_val_y
+
+            # Append Y-coordinate of both wrists for every frame
+            # If a wrist isn't detected in a frame due to water occlusion, append previous frame's value
+            if current_lw_y is not None:
+                left_wrist_y.append(current_lw_y)
+            else:
+                left_wrist_y.append(left_wrist_y[-1] if left_wrist_y else 0.0)
+
+            if current_rw_y is not None:
+                right_wrist_y.append(current_rw_y)
+            else:
+                right_wrist_y.append(right_wrist_y[-1] if right_wrist_y else 0.0)
 
             # Telemetry metrics
             inference_fps = 1.0 / max(1e-5, (time.time() - loop_start))
@@ -385,12 +460,13 @@ def run_tracker(
             # ------------------------------------------------------------------
             # 6. Display Output & User Interaction
             # ------------------------------------------------------------------
-            cv2.imshow(window_name, annotated_frame)
+            if show_preview:
+                cv2.imshow(window_name, annotated_frame)
 
-            key = cv2.waitKey(delay_ms) & 0xFF
-            if key == ord("q") or key == 27:
-                print(f"\n[Interrupted] User pressed 'q' to quit at frame {frame_idx}.")
-                break
+                key = cv2.waitKey(delay_ms) & 0xFF
+                if key == ord("q") or key == 27:
+                    print(f"\n[Interrupted] User pressed 'q' to quit at frame {frame_idx}.")
+                    break
 
     finally:
         # ----------------------------------------------------------------------
@@ -399,8 +475,50 @@ def run_tracker(
         elapsed = time.time() - start_time
         print("\n[Cleanup] Releasing video capture and destroying OpenCV windows...")
         cap.release()
-        cv2.destroyAllWindows()
+        if show_preview:
+            cv2.destroyAllWindows()
         print(f"[Done] Processed {frame_idx} frames in {elapsed:.2f}s ({frame_idx / max(0.001, elapsed):.2f} avg FPS).")
+
+        # ----------------------------------------------------------------------
+        # 8. Plot and Save Stroke Signal Time-Series Data
+        # ----------------------------------------------------------------------
+        if left_wrist_y or right_wrist_y:
+            print("\n[Stroke Analysis] Generating time-series plot of wrist Y-coordinates...")
+            total_pts = max(len(left_wrist_y), len(right_wrist_y))
+            frame_numbers = list(range(1, total_pts + 1))
+
+            plt.figure(figsize=(12, 6))
+            if left_wrist_y:
+                plt.plot(
+                    frame_numbers[: len(left_wrist_y)],
+                    left_wrist_y,
+                    label="Left Wrist Y",
+                    color="tab:blue",
+                    linewidth=1.8,
+                )
+            if right_wrist_y:
+                plt.plot(
+                    frame_numbers[: len(right_wrist_y)],
+                    right_wrist_y,
+                    label="Right Wrist Y",
+                    color="tab:orange",
+                    linewidth=1.8,
+                )
+
+            plt.title("Swimming Stroke Detection - Wrist Y-Coordinate Signal", fontsize=14, fontweight="bold")
+            plt.xlabel("Frame Number", fontsize=12)
+            plt.ylabel("Wrist Y-Coordinate", fontsize=12)
+            plt.legend(loc="upper right")
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.tight_layout()
+
+            plot_output_dir = project_root / "data" / "processed"
+            plot_output_dir.mkdir(parents=True, exist_ok=True)
+            plot_file = plot_output_dir / "stroke_signal.png"
+
+            plt.savefig(str(plot_file), dpi=300)
+            plt.close()
+            print(f"[Stroke Analysis] Stroke signal plot saved to: {plot_file}")
 
 
 # ==============================================================================
@@ -434,6 +552,11 @@ if __name__ == "__main__":
         default=DEFAULT_MODEL_WEIGHTS,
         help=f"YOLO model weights (default: {DEFAULT_MODEL_WEIGHTS})",
     )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Run without displaying OpenCV video playback window",
+    )
 
     args = parser.parse_args()
 
@@ -442,4 +565,5 @@ if __name__ == "__main__":
         conf_threshold=args.conf,
         model_weights=args.weights,
         tracker_config=args.tracker,
+        show_preview=not args.no_display,
     )
